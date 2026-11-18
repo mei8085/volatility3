@@ -39,17 +39,13 @@ class IAT(interfaces.plugins.PluginInterface):
         ]
 
     def _generator(self, procs):
-        kernel = self.context.modules[self.config["kernel"]]
-
         for proc in procs:
             try:
                 proc_id = proc.UniqueProcessId
                 proc_layer_name = proc.add_process_layer()
-                peb = self.context.object(
-                    kernel.symbol_table_name + constants.BANG + "_PEB",
-                    layer_name=proc_layer_name,
-                    offset=proc.Peb,
-                )
+                # get_peb applies the full PEB boundary check, so forged or
+                # truncated PEBs fail here with an InvalidAddressException
+                peb = proc.get_peb()
 
                 if proc_layer_name is None:
                     raise TypeError("add_process_layer failed")

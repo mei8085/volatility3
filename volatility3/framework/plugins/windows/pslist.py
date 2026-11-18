@@ -87,11 +87,9 @@ class PsList(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
         try:
             proc_id = proc.UniqueProcessId
             proc_layer_name = proc.add_process_layer()
-            peb = context.object(
-                kernel_table_name + constants.BANG + "_PEB",
-                layer_name=proc_layer_name,
-                offset=proc.Peb,
-            )
+            # get_peb applies the full PEB boundary check and rejects
+            # forged/truncated PEBs before they can be treated as complete
+            peb = proc.get_peb()
 
             dos_header = context.object(
                 pe_table_name + constants.BANG + "_IMAGE_DOS_HEADER",

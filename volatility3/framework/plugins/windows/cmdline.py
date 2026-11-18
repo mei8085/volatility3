@@ -4,7 +4,7 @@
 import logging
 from typing import List, Optional
 
-from volatility3.framework import constants, exceptions, renderers, interfaces
+from volatility3.framework import exceptions, renderers, interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.framework.objects import utility
 from volatility3.plugins.windows import pslist
@@ -52,16 +52,11 @@ class CmdLine(interfaces.plugins.PluginInterface):
         Returns:
             A string with the command line
         """
-
-        proc_layer_name = proc.add_process_layer()
-        if not proc_layer_name:
-            return None
-
-        peb = context.object(
-            kernel_table_name + constants.BANG + "_PEB",
-            layer_name=proc_layer_name,
-            offset=proc.Peb,
-        )
+        # context and kernel_table_name remain part of the public interface;
+        # EPROCESS.get_peb resolves the process layer and symbol table itself.
+        # go through get_peb so truncated/forged PEBs are rejected with the
+        # same boundary error as every other PEB read entry point
+        peb = proc.get_peb()
 
         return peb.ProcessParameters.CommandLine.get_string()
 

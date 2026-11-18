@@ -770,6 +770,45 @@ class EPROCESS(generic.GenericIntelProcess, pool.ExecutiveObject):
             self._context, dtb, config_prefix, preferred_name
         )
 
+    def _validate_peb_bounds(
+        self,
+        proc_layer_name: str,
+        peb_type_name: str,
+        peb_offset: int,
+    ) -> None:
+        """Validates that the full PEB structure is backed by mapped memory.
+
+        A forged or truncated PEB can point at a mapped first page while later
+        pages (or a page a cross-page field lands on) are unmapped. The single
+        byte ``is_valid`` check performed by the callers only covers the first
+        byte, so this verifies the complete footprint of the structure instead
+        and raises a locatable error when any part is unreadable.
+
+        Args:
+            proc_layer_name: name of the process address space layer
+            peb_type_name: fully qualified type name (e.g. ``table!_PEB``)
+            peb_offset: virtual address of the PEB within the process layer
+
+        Raises:
+            exceptions.InvalidAddressException: when the whole structure cannot
+                be read from the process layer
+        """
+        proc_layer = self._context.layers[proc_layer_name]
+        peb_template = self._context.symbol_space.get_type(peb_type_name)
+        peb_size = peb_template.size
+
+        # is_valid walks every page the range spans, including cross-page
+        # ranges, so a truncated PEB whose second page is unmapped fails here
+        # rather than being accepted as a complete structure.
+        if not proc_layer.is_valid(peb_offset, peb_size):
+            raise exceptions.InvalidAddressException(
+                proc_layer_name,
+                peb_offset,
+                f"PEB at {peb_offset:#x} is not fully mapped "
+                f"(requires {peb_size:#x} bytes across a page boundary)",
+            )
+
+    @functools.lru_cache
     def get_peb(self) -> interfaces.objects.ObjectInterface:
         """Constructs a PEB object"""
         if constants.BANG not in self.vol.type_name:
@@ -788,13 +827,17 @@ class EPROCESS(generic.GenericIntelProcess, pool.ExecutiveObject):
             )
 
         sym_table = self.get_symbol_table_name()
+        peb_type_name = f"{sym_table}{constants.BANG}_PEB"
+        # Reject forged/truncated PEBs before any field can be read from them.
+        self._validate_peb_bounds(proc_layer_name, peb_type_name, self.Peb)
         peb = self._context.object(
-            f"{sym_table}{constants.BANG}_PEB",
+            peb_type_name,
             layer_name=proc_layer_name,
             offset=self.Peb,
         )
         return peb
 
+    @functools.lru_cache
     def get_peb32(self) -> Optional[interfaces.objects.ObjectInterface]:
         """Constructs a PEB32 object"""
         if constants.BANG not in self.vol.type_name:
@@ -846,8 +889,12 @@ class EPROCESS(generic.GenericIntelProcess, pool.ExecutiveObject):
         else:
             offset = proc
 
+        peb32_type_name = f"{self._32bit_table_name}{constants.BANG}_PEB32"
+        # The 32-bit PEB has its own layout and size; apply the same
+        # full-footprint boundary check as the native PEB.
+        self._validate_peb_bounds(proc_layer_name, peb32_type_name, offset)
         peb32 = self._context.object(
-            f"{self._32bit_table_name}{constants.BANG}_PEB32",
+            peb32_type_name,
             layer_name=proc_layer_name,
             offset=offset,
         )
