@@ -10,7 +10,7 @@ from typing import Generator, List
 from importlib.util import find_spec
 
 from volatility3 import schemas, symbols
-from volatility3.framework import constants, interfaces, renderers
+from volatility3.framework import constants, exceptions, interfaces, renderers
 from volatility3.framework.automagic import symbol_cache
 from volatility3.framework.configuration import requirements
 from volatility3.framework.interfaces import plugins
@@ -115,8 +115,8 @@ class IsfInfo(plugins.PluginInterface):
             for entry in filtered_list:
                 num_types = num_enums = num_bases = num_symbols = 0
                 valid = "Unknown"
-                with resources.ResourceAccessor().open(url=entry) as fp:
-                    try:
+                try:
+                    with resources.ResourceAccessor().open(url=entry) as fp:
                         data = json.load(fp)
                         num_symbols = len(data.get("symbols", []))
                         num_types = len(data.get("user_types", []))
@@ -133,9 +133,12 @@ class IsfInfo(plugins.PluginInterface):
                         else:
                             identifier = renderers.NotAvailableValue()
                         valid = check_valid(data)
-                    except (UnicodeDecodeError, json.decoder.JSONDecodeError):
-                        vollog.warning(f"Invalid ISF: {entry}")
-                        continue
+                except exceptions.ResourceIntegrityError as excp:
+                    vollog.warning(f"Refusing unverified ISF {entry}: {excp}")
+                    continue
+                except (UnicodeDecodeError, json.decoder.JSONDecodeError):
+                    vollog.warning(f"Invalid ISF: {entry}")
+                    continue
                 yield (
                     0,
                     (
@@ -167,12 +170,17 @@ class IsfInfo(plugins.PluginInterface):
                         valid = "True (cached)"
                     if self.config["validate"]:
                         # Even if we're not live, if we've been explicitly asked to validate, then do-so
-                        with resources.ResourceAccessor().open(url=location) as fp:
-                            try:
+                        try:
+                            with resources.ResourceAccessor().open(url=location) as fp:
                                 data = json.load(fp)
-                                valid = check_valid(data)
-                            except (UnicodeDecodeError, json.decoder.JSONDecodeError):
-                                vollog.warning(f"Invalid ISF: {location}")
+                            valid = check_valid(data)
+                        except exceptions.ResourceIntegrityError as excp:
+                            vollog.warning(
+                                f"Refusing unverified ISF {location}: {excp}"
+                            )
+                            continue
+                        except (UnicodeDecodeError, json.decoder.JSONDecodeError):
+                            vollog.warning(f"Invalid ISF: {location}")
 
                     yield (
                         0,

@@ -95,6 +95,9 @@ IDENTIFIERS_FILENAME = "identifier.cache"
 CACHE_SQLITE_SCHEMA_VERSION = 1
 """Version for the sqlite3 cache schema"""
 
+REMOTE_INTEGRITY_FILENAME = "remote_integrity.cache"
+"""Default location to record the digests/signatures remote content must match"""
+
 BUG_URL = "https://github.com/volatilityfoundation/volatility3/issues"
 
 ProgressCallback = Optional[Callable[[float, str], None]]
@@ -124,6 +127,14 @@ OFFLINE = False
 
 REMOTE_ISF_URL = None  # 'http://localhost:8000/banners.json'
 """Remote URL to query for a list of ISF addresses"""
+
+REMOTE_ISF_PUBLIC_KEY = None
+"""PEM encoded public key used to verify the signature on a remote identifier listing.
+
+When set, a remote listing that carries a ``signature`` block is only accepted
+when the signature verifies against this key.  When unset, signed listings are
+rejected and only entries carrying their own digests are used.
+"""
 
 DOWNLOAD_TIMEOUT = 30
 """Length of time (in seconds) to wait for another process to download a resource before using it"""

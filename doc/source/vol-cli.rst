@@ -11,7 +11,8 @@ Synopsis
            [-o OUTPUT_DIR] [-q] [-r RENDERER] [-f FILE]
            [--write-config] [--save-config SAVE_CONFIG]
            [--clear-cache] [--cache-path CACHE_PATH]
-           [--offline]
+           [--offline] [-u URL]
+           [--remote-isf-public-key PATH]
            [--single-location SINGLE_LOCATION]
            [--stackers [STACKERS ...]]
            [--single-swap-locations SINGLE_SWAP_LOCATIONS]
@@ -121,6 +122,22 @@ Options
 
 --offline
     Run offline mode (defaults to false).  Do not search online for additional JSON files, remote windows symbol tables, nor linux/mac banner repositories.
+
+-u URL, --remote-isf-url URL
+    Search online for ISF json files using the remote identifier listing at
+    URL.  Listings are only used after their integrity has been checked: TLS
+    certificates are always verified (there is no unverified retry), listings
+    whose signature does not verify are rejected, entries that carry a digest
+    must match it, and truncated or substituted content is rejected before it is
+    parsed.  Local (file/jar) symbol locations and previously verified cached
+    content keep working offline.
+
+--remote-isf-public-key PATH
+    PEM public key used to verify the signature on the remote ISF listing.  When
+    provided, a listing carrying a ``signature`` block must verify against this
+    key or it is rejected.  When omitted, signed listings are rejected and only
+    entries carrying their own digests (or HTTPS/configured-mirror entries) are
+    used.
 
 --single-location SINGLE_LOCATION
     This specifies a URL which will be downloaded if necessary, and built

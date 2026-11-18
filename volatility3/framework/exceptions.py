@@ -129,6 +129,25 @@ class OfflineException(VolatilityException):
         return f"Volatility 3 is offline: unable to access {self._url}"
 
 
+class ResourceIntegrityError(VolatilityException):
+    """Thrown when a resource cannot be trusted enough to be parsed.
+
+    This covers failed certificate checks, digest/signature mismatches,
+    truncated downloads and cached content that no longer matches what the
+    source said it should be.  It is deliberately raised before any content is
+    parsed or handed back to a caller, so that unverified content can never
+    reach a parser.
+    """
+
+    def __init__(self, url: str, reason: str, *args) -> None:
+        super().__init__(reason, *args)
+        self.url = url
+        self.reason = reason
+
+    def __str__(self):
+        return f"Resource failed integrity verification ({self.url}): {self.reason}"
+
+
 class RenderException(VolatilityException):
     """Thrown if there is an error during rendering"""
 

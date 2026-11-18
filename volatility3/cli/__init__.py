@@ -101,6 +101,17 @@ class CommandLine:
         rootlog.setLevel(1)
         rootlog.addHandler(console)
 
+    @staticmethod
+    def _load_remote_isf_public_key(path: str) -> None:
+        """Loads the trusted public key used to verify remote ISF listings."""
+        try:
+            with open(path, encoding="utf-8") as fp:
+                constants.REMOTE_ISF_PUBLIC_KEY = fp.read()
+        except OSError as excp:
+            raise ValueError(
+                f"Unable to read remote ISF public key from {path}: {excp}"
+            ) from excp
+
     def run(self):
         """Executes the command line module, taking the system arguments,
         determining the plugin to run and then running it."""
@@ -235,6 +246,13 @@ class CommandLine:
             type=str,
         )
         parser.add_argument(
+            "--remote-isf-public-key",
+            metavar="PATH",
+            help="PEM public key used to verify signatures on the remote ISF listing",
+            default=None,
+            type=str,
+        )
+        parser.add_argument(
             "--filters",
             help="List of filters to apply to the output (in the form of [+-]columname,pattern[!])",
             default=[],
@@ -311,6 +329,12 @@ class CommandLine:
             constants.OFFLINE = partial_args.offline
         elif partial_args.remote_isf_url:
             constants.REMOTE_ISF_URL = partial_args.remote_isf_url
+
+        if partial_args.remote_isf_public_key:
+            try:
+                self._load_remote_isf_public_key(partial_args.remote_isf_public_key)
+            except ValueError as excp:
+                parser.error(str(excp))
 
         # Do the initialization
         ctx = contexts.Context()  # Construct a blank context
@@ -661,6 +685,15 @@ class CommandLine:
             caused_by = [
                 excp.failure_reason or "An outdated API caller, such as a method.",
                 file_a_bug_msg,
+            ]
+        elif isinstance(excp, exceptions.ResourceIntegrityError):
+            general = "Volatility refused a resource that failed its integrity checks:"
+            detail = f"{excp}"
+            caused_by = [
+                "The resource was served with a certificate that did not verify",
+                "The downloaded content did not match its expected digest/signature",
+                "The download was truncated or a cached copy conflicted with the expected content",
+                "Check connectivity/mirror configuration, or re-run with --clear-cache",
             ]
         else:
             general = "Volatility encountered an unexpected situation."

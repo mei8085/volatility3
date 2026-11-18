@@ -4,6 +4,7 @@
 """Volatility 3 framework."""
 
 # Check the python version to ensure it's suitable
+import contextlib
 import glob
 import sys
 import zipfile
@@ -211,6 +212,21 @@ def clear_cache(complete=True):
                 os.path.join(constants.CACHE_PATH, glob_pattern)
             ):
                 os.unlink(cache_filename)
+            # Partial downloads are renamed into place only once complete, so
+            # anything left as a part file is the residue of an interrupted run.
+            for part_filename in glob.glob(
+                os.path.join(constants.CACHE_PATH, "*.part")
+            ):
+                os.unlink(part_filename)
         os.unlink(os.path.join(constants.CACHE_PATH, constants.IDENTIFIERS_FILENAME))
     except FileNotFoundError:
         vollog.log(constants.LOGLEVEL_VVVV, "Attempting to clear a non-existent cache")
+    # Drop any integrity expectations that were cached in memory, so a cleared
+    # cache is not silently re-seeded from stale data.
+    from volatility3.framework.layers import resources
+
+    resources.reset_expectations()
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(
+            os.path.join(constants.CACHE_PATH, constants.REMOTE_INTEGRITY_FILENAME)
+        )

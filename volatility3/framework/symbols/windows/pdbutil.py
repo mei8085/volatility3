@@ -2,6 +2,7 @@
 # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
 #
 
+import contextlib
 import json
 import logging
 import lzma
@@ -253,9 +254,13 @@ class PDBUtility(interfaces.configuration.VersionableInterface):
                 path, "windows", filter_string + ".json.xz"
             )
             data_written = False
+            # Write to a private part file first, so a conversion that is
+            # interrupted (or that produces invalid JSON) never leaves a
+            # truncated .json.xz behind for a later run to trust.
+            part_output_filename = potential_output_filename + (f".{os.getpid()}.part")
             try:
                 os.makedirs(os.path.dirname(potential_output_filename), exist_ok=True)
-                with lzma.open(potential_output_filename, "w") as of:
+                with lzma.open(part_output_filename, "w") as of:
                     # Once we haven't thrown an error, do the computation
                     filename = pdbconv.PdbRetreiver().retreive_pdb(
                         guid + str(age),
@@ -287,16 +292,24 @@ class PDBUtility(interfaces.configuration.VersionableInterface):
                             "Symbol file could not be downloaded from remote server"
                             + (" " * 100)
                         )
+                if data_written:
+                    # Publish atomically so parallel runs never observe a
+                    # partially written symbol file
+                    os.replace(part_output_filename, potential_output_filename)
                 break
-            except PermissionError:
+            except (PermissionError, exceptions.ResourceIntegrityError) as excp:
                 vollog.debug(
-                    f"Cannot write necessary symbol file, please check permissions on {potential_output_filename}"
+                    f"Cannot write necessary symbol file ({excp}), please check permissions on {potential_output_filename}"
                 )
                 continue
             finally:
                 # If something else failed, removed the symbol file so we don't pick it up in the future
+                if os.path.exists(part_output_filename):
+                    with contextlib.suppress(OSError):
+                        os.remove(part_output_filename)
                 if not data_written and os.path.exists(potential_output_filename):
-                    os.remove(potential_output_filename)
+                    with contextlib.suppress(OSError):
+                        os.remove(potential_output_filename)
                 # Clear out all the temporary file if we constructed one
                 for filename in tmp_files:
                     try:

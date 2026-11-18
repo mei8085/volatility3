@@ -11,10 +11,10 @@ import urllib
 import urllib.parse
 import urllib.request
 from abc import abstractmethod
-from typing import Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 from volatility3 import framework, schemas
-from volatility3.framework import constants, interfaces
+from volatility3.framework import constants, exceptions, interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.framework.layers import resources
 from volatility3.framework.symbols import intermed
@@ -22,6 +22,8 @@ from volatility3.framework.symbols import intermed
 vollog = logging.getLogger(__name__)
 
 BannersType = Dict[bytes, List[str]]
+
+SUPPORTED_HASH_KEYS = resources.SUPPORTED_HASH_ALGORITHMS
 
 
 ### Identifiers
@@ -440,21 +442,38 @@ class SqliteCache(CacheManagerInterface):
             cursor.execute(
                 f"SELECT cached FROM cache WHERE local = 0 and cached < datetime('now', '{self.cache_period}')"
             )
-            remote_identifiers = RemoteIdentifierFormat(constants.REMOTE_ISF_URL)
-            progress_callback(50, "Reading remote ISF list")
-            for operating_system in constants.OS_CATEGORIES:
-                identifiers = remote_identifiers.process(
-                    {}, operating_system=operating_system
+            try:
+                remote_identifiers = RemoteIdentifierFormat(
+                    constants.REMOTE_ISF_URL,
+                    trusted_key=constants.REMOTE_ISF_PUBLIC_KEY,
                 )
-                for identifier, location in identifiers:
-                    identifier = identifier.rstrip()
-                    identifier = (
-                        identifier[:-1] if identifier.endswith(b"\x00") else identifier
-                    )  # Linux banners dumped by dwarf2json end with "\x00\n". If not stripped, the banner cannot match.
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO cache(identifier, location, operating_system, local, cached) VALUES (?, ?, ?, ?, datetime('now'))",
-                        (identifier, location, operating_system, False),
+            except exceptions.ResourceIntegrityError as excp:
+                # A listing that fails verification must not be partially
+                # applied.  Previously cached remote entries stay usable (their
+                # content is still checked when it is opened).
+                vollog.warning(
+                    f"Remote ISF list rejected, keeping existing remote entries: {excp}"
+                )
+                return
+            progress_callback(50, "Reading remote ISF list")
+            # Batch the digest registrations so the expectation file is written
+            # once rather than once per listing entry.
+            with resources.deferred_expectation_saves():
+                for operating_system in constants.OS_CATEGORIES:
+                    identifiers = remote_identifiers.process(
+                        {}, operating_system=operating_system
                     )
+                    for identifier, location in identifiers:
+                        identifier = identifier.rstrip()
+                        identifier = (
+                            identifier[:-1]
+                            if identifier.endswith(b"\x00")
+                            else identifier
+                        )  # Linux banners dumped by dwarf2json end with "\x00\n". If not stripped, the banner cannot match.
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO cache(identifier, location, operating_system, local, cached) VALUES (?, ?, ?, ?, datetime('now'))",
+                            (identifier, location, operating_system, False),
+                        )
             progress_callback(100, "Reading remote ISF list")
             self._database.commit()
 
@@ -547,19 +566,202 @@ class SymbolCacheMagic(interfaces.automagic.AutomagicInterface):
 
 
 class RemoteIdentifierFormat:
-    def __init__(self, location: str):
+    """A list of remote symbol locations, together with the integrity data that
+    each location must satisfy.
+
+    Supported formats:
+
+    * **Version 2** - the integrity-aware format::
+
+          {
+            "version": 2,
+            "windows": {
+              "<base64 identifier>": [
+                {"location": "https://mirror/.../ntkrnlmp.json.xz",
+                 "sha256": "<hex digest>"},
+                {"url": "https://mirror/.../other.json.xz",
+                 "hash": {"algorithm": "sha512", "digest": "<hex digest>"}}
+              ]
+            },
+            "additional": ["https://mirror/other-listing.json"],
+            "signature": {"algorithm": "ed25519", "signature": "<base64>"}
+          }
+
+      Entries may also be plain dictionaries mapping a location to its digest
+      (``{"https://...": "<sha256 hex>"}``).  The optional ``signature`` is a
+      detached signature over the listing (with the ``signature`` member
+      removed) and is only accepted when a trusted public key has been
+      configured via :data:`constants.REMOTE_ISF_PUBLIC_KEY`.
+
+    * **Version 1** - the legacy ``{os: {b64 identifier: [url, ...]}}`` format.
+      Local (``file``/``jar``) locations and locations listed by the
+      user-configured listing keep working.  Locations from a *nested* listing
+      that are plain HTTP with no digest are ignored, because neither their
+      certificate chain nor their content can be verified.
+
+    Every accepted remote location without an explicit digest is registered as
+    a trusted source, so the first successful retrieval pins its digest and
+    later content substituted on the same URL is rejected.
+
+    Any certificate failure while reading a listing, any signature/digest
+    mismatch and any truncated download raise
+    :class:`~volatility3.framework.exceptions.ResourceIntegrityError`; such a
+    listing is never partially applied.
+    """
+
+    def __init__(
+        self,
+        location: str,
+        trusted_key: Optional[str] = None,
+        _depth: int = 0,
+    ):
+        if _depth > 5:
+            raise ValueError("Remote identifier listings are nested too deeply")
         self._location = location
+        self._depth = _depth
+        self._trusted_key = trusted_key
+        self._is_root = _depth == 0
         with resources.ResourceAccessor().open(url=location) as fp:
-            self._data = json.load(fp)
-        if not self._verify():
-            raise ValueError("Unsupported version for remote identifier list format")
+            try:
+                self._data = json.load(fp)
+            except ValueError as excp:
+                raise exceptions.ResourceIntegrityError(
+                    location, f"remote identifier list is not valid JSON: {excp}"
+                ) from excp
+        if not isinstance(self._data, dict):
+            raise exceptions.ResourceIntegrityError(
+                location, "remote identifier list is not a JSON object"
+            )
+        self._verify()
 
     def _verify(self) -> bool:
+        self._verify_signature()
         version = self._data.get("version", 0)
-        if version in [1]:
+        if version in [1, 2]:
+            self._register_listed_digests()
             setattr(self, "process", getattr(self, f"process_v{version}"))
             return True
-        return False
+        raise ValueError("Unsupported version for remote identifier list format")
+
+    def _register_listed_digests(self) -> None:
+        """Registers a flat ``{location: digest}`` integrity map, if present."""
+        hashes = self._data.get("hashes", {})
+        if not isinstance(hashes, dict):
+            raise exceptions.ResourceIntegrityError(
+                self._location, "remote identifier list hashes are not a mapping"
+            )
+        for location, digest in hashes.items():
+            try:
+                resources.register_expected_hash(location, digest)
+            except (TypeError, ValueError, exceptions.ResourceIntegrityError) as excp:
+                vollog.warning(f"Rejecting remote digest for {location}: {excp}")
+
+    def _verify_signature(self) -> None:
+        signature = self._data.get("signature")
+        if signature is None:
+            if self._trusted_key:
+                vollog.warning(
+                    f"Remote identifier list {self._location} is not signed; "
+                    "only entries carrying their own digests will be used"
+                )
+            return
+        if not isinstance(signature, dict) or "signature" not in signature:
+            raise exceptions.ResourceIntegrityError(
+                self._location, "malformed signature block in remote identifier list"
+            )
+        if not self._trusted_key:
+            raise exceptions.ResourceIntegrityError(
+                self._location,
+                "remote identifier list is signed but no trusted public key is configured",
+            )
+        unsigned = {k: v for k, v in self._data.items() if k != "signature"}
+        payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        try:
+            raw_signature = base64.b64decode(signature["signature"], validate=True)
+        except (TypeError, ValueError) as excp:
+            raise exceptions.ResourceIntegrityError(
+                self._location, "malformed signature encoding in remote identifier list"
+            ) from excp
+        resources.verify_downloaded_signature(
+            payload,
+            raw_signature,
+            self._trusted_key,
+            signature.get("algorithm", "ed25519"),
+            url=self._location,
+        )
+
+    @staticmethod
+    def _split_entry(entry: Any) -> Optional[Tuple[str, Any]]:
+        """Extracts ``(location, digest)`` from one listing entry.
+
+        Returns None when the entry is not usable.
+        """
+        if isinstance(entry, str):
+            return entry, None
+        if isinstance(entry, dict):
+            location = entry.get("location", entry.get("url", entry.get("path")))
+            if location is None and len(entry) == 1:
+                # {"https://...": "<digest>"} style
+                location, digest = next(iter(entry.items()))
+                return location, digest
+            if location is None:
+                return None
+            digest = None
+            for key in ("sha256", "sha384", "sha512", "hash", "digest"):
+                if key in entry:
+                    digest = entry[key]
+                    if key in SUPPORTED_HASH_KEYS:
+                        digest = f"{key}:{digest}"
+                    break
+            if digest is None and "algorithm" in entry:
+                digest = f"{entry['algorithm']}:{entry.get('digest', '')}"
+            return location, digest
+        return None
+
+    def _accept_entry(self, location: str, digest: Any) -> bool:
+        """Checks an entry can be trusted, registering its expectation.
+
+        An entry is trusted when any of the following holds:
+
+        * it is a local (``file``/``jar``) location - a configured mirror,
+        * it carries a digest, which is enforced on every retrieval,
+        * the listing was signed with the configured key,
+        * the entry itself is HTTPS (so its certificate chain is verified),
+        * it is named by the listing the user configured.
+
+        A trusted location without a digest is pinned on first use, so content
+        substituted on the same URL later is rejected.  An entry from a nested
+        listing that is plain HTTP and has no digest is rejected: neither its
+        certificate chain nor its content can be verified.
+        """
+        parsed = urllib.parse.urlparse(location)
+        local = parsed.scheme in ("", "file", "jar") or parsed.scheme not in (
+            "http",
+            "https",
+            "ftp",
+            "s3",
+            "gs",
+        )
+        if digest is not None:
+            try:
+                resources.register_expected_hash(location, digest)
+            except (TypeError, ValueError, exceptions.ResourceIntegrityError) as excp:
+                vollog.warning(f"Rejecting remote identifier entry {location}: {excp}")
+                return False
+            return True
+        if local:
+            return True
+        signed = self._trusted_key and self._data.get("signature") is not None
+        if not (signed or parsed.scheme == "https" or self._is_root):
+            vollog.warning(
+                f"Ignoring remote identifier entry {location}: it is not HTTPS, "
+                "carries no digest and the listing is not signed"
+            )
+            return False
+        resources.register_trusted_source(location)
+        return True
 
     def process(
         self, identifiers: Dict[bytes, List[str]], operating_system: Optional[str]
@@ -573,14 +775,80 @@ class RemoteIdentifierFormat:
     ) -> Generator[Tuple[bytes, str], None, None]:
         if operating_system in self._data:
             for identifier in self._data[operating_system]:
-                binary_identifier = base64.b64decode(identifier)
-                for value in self._data[operating_system][identifier]:
-                    yield binary_identifier, value
-        if "additional" in self._data:
-            for location in self._data["additional"]:
                 try:
-                    subrbf = RemoteIdentifierFormat(location)
-                    yield from subrbf.process(identifiers, operating_system)
-                except OSError:
-                    vollog.debug(f"Remote file not found: {location}")
+                    binary_identifier = base64.b64decode(identifier)
+                except (TypeError, ValueError) as excp:
+                    vollog.warning(
+                        f"Skipping malformed identifier in {self._location}: {excp}"
+                    )
+                    continue
+                for entry in self._data[operating_system][identifier]:
+                    split = self._split_entry(entry)
+                    if split is None:
+                        continue
+                    location, digest = split
+                    if self._accept_entry(location, digest):
+                        yield binary_identifier, location
+        yield from self._process_additional(identifiers, operating_system)
         return identifiers
+
+    def process_v2(
+        self,
+        identifiers: Optional[Dict[bytes, List[str]]],
+        operating_system: Optional[str],
+    ) -> Generator[Tuple[bytes, str], None, None]:
+        if operating_system in self._data:
+            entries = self._data[operating_system]
+            if not isinstance(entries, dict):
+                raise exceptions.ResourceIntegrityError(
+                    self._location,
+                    f"identifier section for {operating_system} is not a mapping",
+                )
+            for identifier, locations in entries.items():
+                try:
+                    binary_identifier = base64.b64decode(identifier)
+                except (TypeError, ValueError) as excp:
+                    vollog.warning(
+                        f"Skipping malformed identifier in {self._location}: {excp}"
+                    )
+                    continue
+                if isinstance(locations, (str, dict)):
+                    locations = [locations]
+                for entry in locations:
+                    split = self._split_entry(entry)
+                    if split is None:
+                        vollog.warning(
+                            f"Skipping malformed remote identifier entry for {binary_identifier!r}"
+                        )
+                        continue
+                    location, digest = split
+                    if self._accept_entry(location, digest):
+                        yield binary_identifier, location
+        yield from self._process_additional(identifiers, operating_system)
+        return identifiers
+
+    def _process_additional(
+        self,
+        identifiers: Optional[Dict[bytes, List[str]]],
+        operating_system: Optional[str],
+    ) -> Generator[Tuple[bytes, str], None, None]:
+        for entry in self._data.get("additional", []):
+            split = self._split_entry(entry)
+            if split is None:
+                continue
+            location, digest = split
+            if not self._accept_entry(location, digest):
+                continue
+            try:
+                subrbf = RemoteIdentifierFormat(
+                    location,
+                    trusted_key=self._trusted_key,
+                    _depth=self._depth + 1,
+                )
+                yield from subrbf.process(identifiers, operating_system)
+            except exceptions.ResourceIntegrityError as excp:
+                vollog.warning(
+                    f"Rejected nested remote identifier list {location}: {excp}"
+                )
+            except OSError:
+                vollog.debug(f"Remote file not found: {location}")

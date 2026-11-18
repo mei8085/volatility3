@@ -174,6 +174,13 @@ class VolShell(cli.CommandLine):
             default=constants.REMOTE_ISF_URL,
             type=str,
         )
+        parser.add_argument(
+            "--remote-isf-public-key",
+            metavar="PATH",
+            help="PEM public key used to verify signatures on the remote ISF listing",
+            default=None,
+            type=str,
+        )
 
         # Volshell specific flags
         os_specific = parser.add_mutually_exclusive_group(required=False)
@@ -247,6 +254,12 @@ class VolShell(cli.CommandLine):
             constants.OFFLINE = partial_args.offline
         elif partial_args.remote_isf_url:
             constants.REMOTE_ISF_URL = partial_args.remote_isf_url
+
+        if partial_args.remote_isf_public_key:
+            try:
+                self._load_remote_isf_public_key(partial_args.remote_isf_public_key)
+            except ValueError as excp:
+                parser.error(str(excp))
 
         # Do the initialization
         ctx = contexts.Context()  # Construct a blank context

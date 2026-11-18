@@ -4,6 +4,28 @@ API Changes
 When an addition to the existing API is made, the minor version is bumped.
 When an API feature or function is removed or changed, the major version is bumped.
 
+2.29.0
+======
+Remote ISF retrieval now verifies downloads before they are used.  TLS
+certificates are always verified (the previous unverified retry has been
+removed), incomplete downloads never replace a cache entry, and cached content
+that no longer satisfies its expected digest/signature is rejected instead of
+being parsed.
+* `layers.resources.ResourceAccessor` accepts an `expected_hash` and rejects
+  unverified/truncated content with `exceptions.ResourceIntegrityError`.
+* New `layers.resources` helpers: `normalize_expected_hash`,
+  `register_expected_hash`, `get_expected_hash`, `register_expected_signature`,
+  `register_trusted_source`, `pin_content_hash` and
+  `verify_downloaded_signature`.
+* New `exceptions.ResourceIntegrityError`.
+* New constants `REMOTE_ISF_PUBLIC_KEY` and `REMOTE_INTEGRITY_FILENAME`.
+* `automagic.symbol_cache.RemoteIdentifierFormat` accepts a trusted key,
+  supports listing version 2 (per-entry digests and an optional listing
+  signature) and rejects unverifiable entries.
+* New CLI option `--remote-isf-public-key`.
+* `symbols.windows.pdbutil.PDBUtility.download_pdb_isf` publishes the generated
+  `.json.xz` atomically and no longer leaves a partial file behind.
+
 2.25.0
 ======
 Pointer class now supports `get_raw_value()`.
